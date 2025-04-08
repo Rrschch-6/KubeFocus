@@ -137,10 +137,10 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Train VJEPa model")
     parser.add_argument("--video_paths", type=str, required=True, help="Path to video dataset")
-    parser.add_argument("--num_frames", type=int, default=5, help="Number of frames per video")
+    parser.add_argument("--num_frames", type=int, required=True, help="Number of frames per video")
     parser.add_argument("--embed_dim", type=int, default=64, help="Embedding dimension")
     parser.add_argument("--patch_size", type=int, default=8, help="Patch size")
-    parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
+    parser.add_argument("--batch_size", type=int, required=True, help="Batch size")
     parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs")
     parser.add_argument("--learning_rate", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--mask_ratio", type=float, default=0.75, help="Mask ratio for patches")

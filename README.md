@@ -26,7 +26,12 @@ pod_name = "node_k8s-worker-1"
 pred = detector.predict(traffic_input, metrics_input, log_text, pod_name)
 
 
+# Training V-JEPA
+```bash
 
+python3 train_vjepa.py --video_path PATH_TO_DATASET.pt --num_frames 3 --batch_size 8 --num_epochs 200 --learning_rate 0.0003
+
+```
 
 
 
