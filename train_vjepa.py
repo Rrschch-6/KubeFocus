@@ -1,179 +1,157 @@
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
-from tqdm import tqdm
+from torch.utils.data import DataLoader
+import copy
+import tqdm
 
+# Assuming these are defined in separate modules
+from model import SimplifiedVisionTransformer, SimplePredictor
+from dataset import VideoDataset
+#TODO: Add tensorboard
+# from tensorboardX import SummaryWriter
 
+def main(args, device):
+    # Initialize models
+    encoder = SimplifiedVisionTransformer(
+        num_frames=args.num_frames,
+        embed_dim=args.embed_dim,
+        patch_size=args.patch_size,
+        depth=1,
+        num_heads=2,
+        mlp_ratio=4.0
+    ).to(device)
 
-# CUDA boost
-torch.backends.cudnn.benchmark = True
+    predictor = SimplePredictor(
+        embed_dim=args.embed_dim,
+        predictor_embed_dim=32,
+        num_frames=args.num_frames,
+        patch_size=args.patch_size,
+        img_size=32,
+        use_mask_tokens=True
+    ).to(device)
 
-# Config
-DATA_DIR = "/home/sascha/KubeFocus/video/final_benign_dataset/image_dataset.pt"
-SEQ_LEN = 5
-LATENT_DIM = 256
-BATCH_SIZE = 256
-EPOCHS = 10
-MASK_RATIO = 0.3
-MASKING_MODE = "random"  # or: "random", "block", "center","causal"
-SAVE_PATH = "/home/sascha/KubeFocus/artifacts/models"
-os.makedirs(SAVE_PATH, exist_ok=True)
+    target_encoder = copy.deepcopy(encoder).to(device)
+    for param in target_encoder.parameters():
+        param.requires_grad = False
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-class SequenceDataset(Dataset):
-    def __init__(self, file_path, seq_len):
-        self.seq_len = seq_len
-
-        print(f"📂 Loading data from: {file_path}")
-        raw_data = torch.load(file_path)
-
-        if not isinstance(raw_data, list):
-            raise ValueError("The loaded .pt file must be a list of dicts with keys 'image' and 'label'.")
-
-        self.data = [d for d in raw_data if isinstance(d, dict) and "image" in d and d["image"].ndim == 3]
-        skipped = len(raw_data) - len(self.data)
-
-        print(f"✅ Valid frames loaded: {len(self.data)}")
-        print(f"❌ Skipped invalid frames: {skipped}")
-        print(f"🧮 Usable sequences (len): {max(0, len(self.data) - self.seq_len + 1)}")
-
-    def __len__(self):
-        return max(0, len(self.data) - self.seq_len + 1)
-
-    def __getitem__(self, idx):
-        seq = self.data[idx:idx + self.seq_len]
-        images = torch.stack([s["image"].float() / 255.0 for s in seq])  # shape (T, H, W, C)
-        images = images.permute(0, 3, 1, 2)  # ➜ shape (T, C, H, W)
-        return images
-
-
-# Encoder
-class Encoder(nn.Module):
-    def __init__(self, latent_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 64, 4, 2, 1),  # 16x16
-            nn.ReLU(),
-            nn.Conv2d(64, 128, 4, 2, 1),  # 8x8
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(8 * 8 * 128, latent_dim)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class TransformerPredictor(nn.Module):
-    def __init__(self, latent_dim, seq_len, n_heads=4, num_layers=2):
-        super().__init__()
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=latent_dim, nhead=n_heads, dim_feedforward=latent_dim * 4, batch_first=True
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.pos_embedding = nn.Parameter(torch.randn(1, seq_len, latent_dim))
-
-    def forward(self, x):
-        # x: (B, T, D)
-        x = x + self.pos_embedding[:, :x.size(1), :]
-        return self.encoder(x)  # (B, T, D)
-
-# # Add this globally in your script — define mask token once
-mask_token = nn.Parameter(torch.zeros(LATENT_DIM), requires_grad=True).to(DEVICE)
-
-def train():
-    dataset = SequenceDataset(DATA_DIR, SEQ_LEN)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-
-    encoder = Encoder(LATENT_DIM).to(DEVICE)
-    predictor = TransformerPredictor(LATENT_DIM, seq_len=SEQ_LEN).to(DEVICE)
-
-    mask_token = nn.Parameter(torch.zeros(LATENT_DIM, device=DEVICE))
-
-    optimizer = torch.optim.Adam(
-        list(encoder.parameters()) + list(predictor.parameters()) + [mask_token],
-        lr=1e-4
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        list(encoder.parameters()) + list(predictor.parameters()),
+        lr=args.learning_rate
     )
 
-    epoch_losses = []
+    # Dataset and DataLoader
+    # Replace with actual video file paths
+    dataset = VideoDataset(args.video_paths, frames_per_video=args.num_frames)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-    for epoch in range(EPOCHS):
-        encoder.train()
-        predictor.train()
-        total_loss = 0.0
+    # Random mask generation function
+    def generate_masks(batch_size, total_patches, mask_ratio):
+        """
+        Generate random masks for encoder (visible patches) and predictor (masked patches).
+        Args:
+            batch_size (int): Number of samples in the batch.
+            total_patches (int): Total number of patches per video.
+            mask_ratio (float): Fraction of patches to mask (0 to 1).
+        Returns:
+            masks_enc (torch.Tensor): Boolean mask for encoder, True for visible patches.
+            masks_pred (torch.Tensor): Boolean mask for predictor, True for masked patches.
+        """
+        num_visible = int(total_patches * (1 - mask_ratio))  # e.g., 20 if total=80, mask_ratio=0.75
+        masks_enc = torch.zeros(batch_size, total_patches, dtype=torch.bool)
+        masks_pred = torch.zeros(batch_size, total_patches, dtype=torch.bool)
+        for b in range(batch_size):
+            # Randomly permute patch indices
+            perm = torch.randperm(total_patches)
+            visible_idx = perm[:num_visible]  # Indices of visible patches
+            pred_idx = perm[num_visible:]     # Indices of masked patches
+            masks_enc[b, visible_idx] = True
+            masks_pred[b, pred_idx] = True
+        return masks_enc, masks_pred
 
-        loop = tqdm(loader, desc=f"📚 Epoch {epoch+1}/{EPOCHS}", leave=False)
-        for images in loop:
-            B, T, C, H, W = images.shape
-            images = images.to(DEVICE)
+    # Training loop
+    pbar = tqdm.trange(0, args.num_epochs, desc=f'{args.num_frames} frames per video')
+    for epoch in pbar:
+        total_loss = 0
+        for itr, x in enumerate(loader):
+            x = x.to(device)  # Shape: (B, 3, num_frames, 32, 32)
+            B = x.size(0)
 
-            latents = encoder(images.view(B * T, C, H, W)).view(B, T, -1)
+            # Generate masks
+            masks_enc, masks_pred = generate_masks(B, args.total_patches, args.mask_ratio)
+            masks_enc = masks_enc.to(device)
+            masks_pred = masks_pred.to(device)
 
-            # Apply selected masking strategy
-            if MASKING_MODE == "random":
-                mask = torch.rand(B, T, device=DEVICE) < MASK_RATIO
-            elif MASKING_MODE == "causal":
-                num_masked = int(MASK_RATIO * T)
-                mask = torch.zeros(B, T, dtype=torch.bool, device=DEVICE)
-                mask[:, -num_masked:] = True
-            elif MASKING_MODE == "block":
-                mask = torch.zeros(B, T, dtype=torch.bool, device=DEVICE)
-                block_len = max(1, int(MASK_RATIO * T))
-                start = torch.randint(0, T - block_len + 1, (B,), device=DEVICE)
-                for i in range(B):
-                    mask[i, start[i]:start[i] + block_len] = True
-            elif MASKING_MODE == "center":
-                mask = torch.zeros(B, T, dtype=torch.bool, device=DEVICE)
-                mask[:, T // 2] = True
-            else:
-                raise ValueError(f"Unknown masking mode: {MASKING_MODE}")
+            # Forward target encoder (full input)
+            with torch.no_grad():
+                h_full = target_encoder(x)  # (B, total_patches, embed_dim)
+                # Select features for masked patches
+                num_pred = args.total_patches - int(args.total_patches * (1 - args.mask_ratio))
+                h = h_full[masks_pred].view(B, num_pred, args.embed_dim)  # (B, num_pred, embed_dim)
 
-            if mask.sum() == 0 or (~mask).sum() == 0:
-                continue
+            # Forward encoder (visible patches)
+            z = encoder(x, masks_enc)  # (B, num_visible, embed_dim)
 
-            masked_latents = latents.clone()
-            masked_latents[mask] = mask_token
+            # Forward predictor (predict masked patches)
+            pred = predictor(z, h, masks_enc, masks_pred)  # (B, num_pred, embed_dim)
 
-            predicted_latents = predictor(masked_latents)
-            target = latents[mask]
-            predicted = predicted_latents[mask]
-            loss = F.mse_loss(predicted, target)
+            # Compute loss
+            loss = F.mse_loss(pred, h)
 
+            # Backward and optimize
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+            # Update target encoder with EMA
+            with torch.no_grad():
+                for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
+                    param_k.data = args.momentum * param_k.data + (1 - args.momentum) * param_q.data
+
             total_loss += loss.item()
-            loop.set_postfix(loss=loss.item())
 
-        epoch_loss = total_loss / len(loader)
-        epoch_losses.append(epoch_loss)
-        print(f"📉 Epoch {epoch+1}/{EPOCHS}, Loss: {epoch_loss:.6f}")
+            # Logging every 10 iterations
+            if itr % 10 == 0:
+                pbar.set_postfix({"Iter": f"{itr}/{len(loader)}", "Loss": f"{loss.item():.4f}"})
 
-    # Save model
-    model_path = f"{SAVE_PATH}/vjepa_model__{MASKING_MODE}_len_{SEQ_LEN}_ratio_{MASK_RATIO}.pt"
-    torch.save({
-        "encoder": encoder.state_dict(),
-        "predictor": predictor.state_dict(),
-        "mask_token": mask_token.detach().cpu()
-    }, model_path)
-    print(f"✅ Model saved to {model_path}")
+        # Average loss per epoch
+        avg_loss = total_loss / len(loader)
+        print(f"Epoch [{epoch+1}/{args.num_epochs}], Average Loss: {avg_loss:.4f}")
 
-    # Save loss plot
-    plt.figure()
-    plt.plot(range(1, EPOCHS + 1), epoch_losses, marker='o')
-    plt.title(f"Training Loss - Masking: {MASKING_MODE} seq length: {SEQ_LEN} masking ratio: {MASK_RATIO}")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.grid(True)
-    loss_plot_path = f"{SAVE_PATH}/loss_plot_{MASKING_MODE}_len_{SEQ_LEN}_ratio_{MASK_RATIO}.png"
-    plt.savefig(loss_plot_path)
-    print(f"📈 Loss plot saved to {loss_plot_path}")
+        if epoch % 10 == 0:
+            # Save checkpoint
+            checkpoint = {
+                'encoder': encoder.state_dict(),
+                'predictor': predictor.state_dict(),
+                'target_encoder': target_encoder.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch + 1,
+                'loss': avg_loss
+            }
+            torch.save(checkpoint, f'logs/checkpoint_{args.num_frames}_fpv_epoch_{epoch+1}.pth')
 
+    print("Training completed!")
 
 if __name__ == "__main__":
-    train()
+    import argparse
+    parser = argparse.ArgumentParser(description="Train VJEPa model")
+    parser.add_argument("--video_paths", type=str, required=True, help="Path to video dataset")
+    parser.add_argument("--num_frames", type=int, default=5, help="Number of frames per video")
+    parser.add_argument("--embed_dim", type=int, default=64, help="Embedding dimension")
+    parser.add_argument("--patch_size", type=int, default=8, help="Patch size")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
+    parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs")
+    parser.add_argument("--learning_rate", type=float, default=0.001, help="Learning rate")
+    parser.add_argument("--mask_ratio", type=float, default=0.75, help="Mask ratio for patches")
+    parser.add_argument("--momentum", type=float, default=0.999, help="Momentum for target encoder update")
+    parser.add_argument("--total_patches", type=int, default=80, help="Total patches per video")
+    parser.add_argument("--img_size", type=int, default=32, help="Image size (height and width)")
 
+    args = parser.parse_args()
+    
+    # Training
+    args.total_patches = args.num_frames * (args.img_size // args.patch_size) ** 2
+    print(f"Total patches: {args.total_patches}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    main(args, device=device)
