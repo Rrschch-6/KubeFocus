@@ -5,6 +5,19 @@ import torch.nn.functional as F
 import torch
 import torch.nn as nn
 
+class SimpleDetectorHead(nn.Module):
+    """A simple detector using the pre-trained simplified V-JEPA 
+    trained on our dataset as backbone for intrusion detection."""
+    def __init__(self, input_dim=64, num_classes=1, img_size=32, patch_size=8):
+        super(SimpleDetectorHead, self).__init__()
+        self.num_patches = (img_size // patch_size)**2  # e.g., 32 / 8 **2 = 16
+        self.fc = nn.Linear(input_dim*self.num_patches, num_classes)
+
+    def forward(self, x):
+        x = x.flatten(start_dim=1)  # Flatten the input
+        x = self.fc(x)
+        return x.squeeze(-1)  # Remove the last dimension
+    
 class SimplePredictor(nn.Module):
     """A lightweight predictor for 32x32x3xnum_frames input, avoiding transformers."""
     def __init__(
@@ -14,6 +27,7 @@ class SimplePredictor(nn.Module):
         num_frames=1,            # Number of frames in the input
         patch_size=8,            # Size of each patch (e.g., 8x8)
         img_size=32,             # Image size (32x32)
+        in_channels=3,          # Number of input channels (e.g., RGB)
         use_mask_tokens=False,   # Whether to use learnable mask tokens
         init_std=0.02            # Standard deviation for initialization
     ):
@@ -23,6 +37,7 @@ class SimplePredictor(nn.Module):
         self.num_frames = num_frames
         self.patch_size = patch_size
         self.img_size = img_size
+        self.in_channels = in_channels
 
         # Calculate number of patches
         grid_size = img_size // patch_size  # e.g., 32 / 8 = 4
@@ -115,16 +130,18 @@ class SimplifiedVisionTransformer(nn.Module):
         depth=1,
         num_heads=2,
         mlp_ratio=4.0,
-        norm_layer=nn.LayerNorm
+        norm_layer=nn.LayerNorm,
+        in_channels=3,
     ):
         super().__init__()
         self.num_frames = num_frames
         self.patch_size = patch_size
         self.embed_dim = embed_dim
+        self.in_channels = in_channels
 
         # Patch embedding: 2D convolution applied per frame (tubelet_size=1)
         self.patch_embed = nn.Conv2d(
-            in_channels=3,
+            in_channels=self.in_channels,
             out_channels=embed_dim,
             kernel_size=patch_size,
             stride=patch_size
@@ -209,8 +226,9 @@ class SimplifiedVisionTransformer(nn.Module):
 # Example usage
 if __name__ == "__main__":
     num_frames = 5
-    model = SimplifiedVisionTransformer(num_frames=num_frames)
-    x = torch.randn(2, 3, num_frames, 32, 32)
+    in_channels = 3
+    model = SimplifiedVisionTransformer(num_frames=num_frames, in_channels=in_channels)
+    x = torch.randn(2, in_channels, num_frames, 32, 32)
     total_patches = model.total_patches  # 5 * 16 = 80
     masks = torch.zeros(2, total_patches, dtype=torch.bool)
     masks[:, :40] = True  # Keep 40 patches per sample

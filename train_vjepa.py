@@ -8,6 +8,7 @@ import tqdm
 # Assuming these are defined in separate modules
 from model import SimplifiedVisionTransformer, SimplePredictor
 from dataset import VideoDataset
+from util import generate_masks
 #TODO: Add tensorboard
 # from tensorboardX import SummaryWriter
 
@@ -27,7 +28,7 @@ def main(args, device):
         predictor_embed_dim=32,
         num_frames=args.num_frames,
         patch_size=args.patch_size,
-        img_size=32,
+        img_size=args.img_size,
         use_mask_tokens=True
     ).to(device)
 
@@ -43,37 +44,23 @@ def main(args, device):
 
     # Dataset and DataLoader
     # Replace with actual video file paths
-    dataset = VideoDataset(args.video_paths, frames_per_video=args.num_frames)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    dataset = VideoDataset(args.video_paths, frames_per_video=args.num_frames, train=True)
+    val_dataset = VideoDataset(args.video_paths, frames_per_video=args.num_frames, train=False)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
-    # Random mask generation function
-    def generate_masks(batch_size, total_patches, mask_ratio):
-        """
-        Generate random masks for encoder (visible patches) and predictor (masked patches).
-        Args:
-            batch_size (int): Number of samples in the batch.
-            total_patches (int): Total number of patches per video.
-            mask_ratio (float): Fraction of patches to mask (0 to 1).
-        Returns:
-            masks_enc (torch.Tensor): Boolean mask for encoder, True for visible patches.
-            masks_pred (torch.Tensor): Boolean mask for predictor, True for masked patches.
-        """
-        num_visible = int(total_patches * (1 - mask_ratio))  # e.g., 20 if total=80, mask_ratio=0.75
-        masks_enc = torch.zeros(batch_size, total_patches, dtype=torch.bool)
-        masks_pred = torch.zeros(batch_size, total_patches, dtype=torch.bool)
-        for b in range(batch_size):
-            # Randomly permute patch indices
-            perm = torch.randperm(total_patches)
-            visible_idx = perm[:num_visible]  # Indices of visible patches
-            pred_idx = perm[num_visible:]     # Indices of masked patches
-            masks_enc[b, visible_idx] = True
-            masks_pred[b, pred_idx] = True
-        return masks_enc, masks_pred
+    def reg_fn(z) -> torch.Tensor:
+        return sum([torch.sqrt(zi.var(dim=1) + 0.0001) for zi in z]) / len(z)
+    
 
     # Training loop
     pbar = tqdm.trange(0, args.num_epochs, desc=f'{args.num_frames} frames per video')
+    val_loss = torch.tensor(0.0)
     for epoch in pbar:
         total_loss = 0
+        encoder.train()
+        target_encoder.train()
+        predictor.train()
         for itr, x in enumerate(loader):
             x = x.to(device)  # Shape: (B, 3, num_frames, 32, 32)
             B = x.size(0)
@@ -97,7 +84,10 @@ def main(args, device):
             pred = predictor(z, h, masks_enc, masks_pred)  # (B, num_pred, embed_dim)
 
             # Compute loss
-            loss = F.mse_loss(pred, h)
+            loss_jepa = F.mse_loss(pred, h)
+            pstd_z = reg_fn(z)  # predictor variance across patches
+            loss_reg = torch.mean(F.relu(1.-pstd_z))
+            loss = loss_jepa + args.reg_coeff * loss_reg
 
             # Backward and optimize
             optimizer.zero_grad()
@@ -113,7 +103,7 @@ def main(args, device):
 
             # Logging every 10 iterations
             if itr % 10 == 0:
-                pbar.set_postfix({"Iter": f"{itr}/{len(loader)}", "Loss": f"{loss.item():.4f}"})
+                pbar.set_postfix({"Iter": f"{itr}/{len(loader)}", "Loss": f"{loss.item():.4f}", "Val Loss": f"{val_loss.item():.4f}"})
 
         # Average loss per epoch
         avg_loss = total_loss / len(loader)
@@ -131,6 +121,46 @@ def main(args, device):
             }
             torch.save(checkpoint, f'logs/checkpoint_{args.num_frames}_fpv_epoch_{epoch+1}.pth')
 
+            @torch.no_grad()
+            def validate() -> None:
+                print("Validating...")
+                target_encoder.eval()
+                encoder.eval()
+                val_loss = 0
+                for x in val_loader:
+                    x = x.to(device)  # Shape: (B, 3, num_frames, 32, 32)
+                    B = x.size(0)
+
+                    # Generate masks
+                    masks_enc, masks_pred = generate_masks(B, args.total_patches, args.mask_ratio)
+                    masks_enc = masks_enc.to(device)
+                    masks_pred = masks_pred.to(device)
+
+                    # Forward target encoder (full input)
+                    with torch.no_grad():
+                        h_full = target_encoder(x)  # (B, total_patches, embed_dim)
+                        # Select features for masked patches
+                        num_pred = args.total_patches - int(args.total_patches * (1 - args.mask_ratio))
+                        h = h_full[masks_pred].view(B, num_pred, args.embed_dim)  # (B, num_pred, embed_dim)
+
+                    # Forward encoder (visible patches)
+                    z = encoder(x, masks_enc)  # (B, num_visible, embed_dim)
+
+                    # Forward predictor (predict masked patches)
+                    pred = predictor(z, h, masks_enc, masks_pred)  # (B, num_pred, embed_dim)
+
+                    # Compute loss
+                    val_loss += F.mse_loss(pred.detach(), h.detach())
+                
+                val_loss /= len(val_loader)
+                print(f"Validation Loss Average: {val_loss.item():.4f}")
+                pbar.set_postfix({"Iter": f"{itr}/{len(loader)}", "Loss": f"{loss.item():.4f}", "Val Loss": f"{val_loss.item():.4f}"})
+                return val_loss 
+
+            # Call validation function
+            val_loss = validate()              
+
+
     print("Training completed!")
 
 if __name__ == "__main__":
@@ -145,6 +175,7 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--mask_ratio", type=float, default=0.75, help="Mask ratio for patches")
     parser.add_argument("--momentum", type=float, default=0.999, help="Momentum for target encoder update")
+    parser.add_argument("--reg_coeff", type=float, default=0.01, help="Regularization coefficient")
     parser.add_argument("--total_patches", type=int, default=80, help="Total patches per video")
     parser.add_argument("--img_size", type=int, default=32, help="Image size (height and width)")
 

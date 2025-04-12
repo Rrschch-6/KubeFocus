@@ -14,8 +14,57 @@ from PIL import Image
 import os
 from datetime import datetime, timedelta
 import time
-from tqdm import tqdm
+from torch import Tensor
 
+# Random mask generation function
+def generate_masks(batch_size, total_patches, mask_ratio) -> tuple[Tensor, Tensor]:
+    """
+    Generate random masks for encoder (visible patches) and predictor (masked patches).
+    Args:
+        batch_size (int): Number of samples in the batch.
+        total_patches (int): Total number of patches per video.
+        mask_ratio (float): Fraction of patches to mask (0 to 1).
+    Returns:
+        masks_enc (torch.Tensor): Boolean mask for encoder, True for visible patches.
+        masks_pred (torch.Tensor): Boolean mask for predictor, True for masked patches.
+    """
+    num_visible = int(total_patches * (1 - mask_ratio))  # e.g., 20 if total=80, mask_ratio=0.75
+    masks_enc = torch.zeros(batch_size, total_patches, dtype=torch.bool)
+    masks_pred = torch.zeros(batch_size, total_patches, dtype=torch.bool)
+    for b in range(batch_size):
+        # Randomly permute patch indices
+        perm = torch.randperm(total_patches)
+        visible_idx = perm[:num_visible]  # Indices of visible patches
+        pred_idx = perm[num_visible:]     # Indices of masked patches
+        masks_enc[b, visible_idx] = True
+        masks_pred[b, pred_idx] = True
+    return masks_enc, masks_pred
+
+def mask_future(batch_size: int, total_patches: int, mask_ratio: float, fpv: int) -> tuple[Tensor, Tensor]:
+    """
+    Generate random masks for encoder (visible patches) and predictor (masked patches).
+    Args:
+        batch_size (int): Number of samples in the batch.
+        total_patches (int): Total number of patches per video.
+        mask_ratio (float): Fraction of patches to mask (0 to 1).
+        fpv (int): frames per video
+    Returns:
+        masks_enc (torch.Tensor): Boolean mask for encoder, True for visible patches.
+        masks_pred (torch.Tensor): Boolean mask for predictor, True for masked patches.
+    """
+    num_visible = int(total_patches * (1 - mask_ratio))  # e.g., 20 if total=80, mask_ratio=0.75
+    masks_enc = torch.zeros(batch_size, total_patches, dtype=torch.bool)
+    masks_pred = torch.zeros(batch_size, total_patches, dtype=torch.bool)
+    
+    # future patches indices
+    num_frames_masked = int(fpv * mask_ratio)
+    patch_per_frame = int(total_patches / fpv)
+    indices = torch.arange(0, total_patches, dtype=torch.long)
+    future_indices = indices[-num_frames_masked*patch_per_frame:] # Indices of masked patches
+    visible_indices = indices[:-num_frames_masked*patch_per_frame]  # Indices of visible patches
+    masks_enc[:, visible_indices] = True
+    masks_pred[:, future_indices] = True
+    return masks_enc, masks_pred
 
 def scale_to_255(df, columns_to_exclude=None):
     df_scaled = df.copy()
