@@ -16,6 +16,56 @@ from datetime import datetime, timedelta
 import time
 from torch import Tensor
 
+def future_row_masks(batch_size, max_length, mask_ratio):
+    """
+    Generate random masks for rows.
+    
+    Args:
+        batch_size (int): Number of samples in the batch.
+        max_length (int): Maximum sequence length.
+        mask_ratio (float): Fraction of rows to mask (0 to 1).
+    
+    Returns:
+        masks_enc (torch.Tensor): Boolean mask for encoder, True for visible rows.
+        masks_pred (torch.Tensor): Boolean mask for predictor, True for masked rows.
+    """
+    num_visible = int(max_length * (1 - mask_ratio))
+    masks_enc = torch.zeros(batch_size, max_length, dtype=torch.bool)
+    masks_pred = torch.zeros(batch_size, max_length, dtype=torch.bool)
+    for i in range(batch_size):
+        perm = torch.randperm(max_length)
+        visible_idx = perm[:num_visible]
+        pred_idx = perm[num_visible:]
+        masks_enc[i, visible_idx] = True
+        masks_pred[i, pred_idx] = True
+    return masks_enc, masks_pred
+
+def generate_row_masks(batch_size, max_length, mask_ratio):
+    """
+    Generate random masks for rows.
+    
+    Args:
+        batch_size (int): Number of samples in the batch.
+        max_length (int): Maximum sequence length.
+        mask_ratio (float): Fraction of rows to mask (0 to 1).
+    
+    Returns:
+        masks_enc (torch.Tensor): Boolean mask for encoder, True for visible rows.
+        masks_pred (torch.Tensor): Boolean mask for predictor, True for masked rows.
+    """
+    num_visible = int(max_length * (1 - mask_ratio))
+    masks_enc = torch.zeros(batch_size, max_length, dtype=torch.bool)
+    masks_pred = torch.zeros(batch_size, max_length, dtype=torch.bool)
+
+    # future patches indices
+    num_masked = int(max_length * mask_ratio)
+    indices = torch.arange(0, max_length, dtype=torch.long)
+    future_idx = indices[-num_masked:] # Indices of masked patches
+    visible_idx = indices[:-num_masked]  # Indices of visible patches
+    masks_enc[:, visible_idx] = True
+    masks_pred[:, future_idx] = True
+    return masks_enc, masks_pred
+
 # Random mask generation function
 def generate_masks(batch_size, total_patches, mask_ratio) -> tuple[Tensor, Tensor]:
     """

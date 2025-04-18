@@ -1,5 +1,7 @@
 import torch
 from torch.utils.data import Dataset
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
 
 class VideoDataset(Dataset):
     def __init__(self,
@@ -56,3 +58,46 @@ class DetectionDataset(Dataset):
         return {"video": video.permute(3,0,1,2).to(torch.float32),
                 "label": torch.tensor(label).to(torch.long),
                 "all_labels": labels,}
+    
+class TabularDataset(Dataset):
+    def __init__(self,
+                 path: str,
+                 max_len: int,
+                 label_col_name: str='attack') -> None:
+        super().__init__()
+        self.df = pd.read_csv(path)
+        self.label = self.df[label_col_name].values
+        self.df = self.df.drop(columns=[label_col_name])
+        self.max_len = max_len
+        self.num_features = self.df.shape[1]
+        # Normalization
+        scaler = StandardScaler()
+        self.df = scaler.fit_transform(self.df)
+
+        # Create sequences of length max_len from the rows
+        self.sequences = []
+        self.labels = []
+        for i in range(len(self.df) - max_len + 1):
+            seq = self.df[i:i + max_len]
+            self.sequences.append(seq)
+            self.labels.append(self.label[i:i + max_len])
+        
+    def __len__(self) -> int:
+        return len(self.sequences)
+    
+    def __getitem__(self, idx: int) -> dict:
+        seq = self.sequences[idx]
+        label = self.labels[idx]
+        # Convert to tensors
+        seq_tensor = torch.tensor(seq, dtype=torch.float32)
+        # label = 1 if any(label) else 0
+        label_tensor = torch.tensor(label, dtype=torch.long)
+        return {"sequence": seq_tensor, "label": label_tensor}
+
+    # Pad sequences to max length L
+    def pad_sequence(seq, max_len):
+        pad_len = max_len - seq.shape[0]
+        if pad_len > 0:
+            padding = torch.zeros(pad_len, seq.shape[1])
+            return torch.cat([torch.tensor(seq), padding], dim=0)
+        return torch.tensor(seq[:max_len])

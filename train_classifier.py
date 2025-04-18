@@ -2,7 +2,7 @@
 import torch
 
 from model import SimplifiedVisionTransformer, SimpleDetectorHead
-from inference import SurpriseScoreEstimator
+from inference_video import SurpriseScoreEstimator
 from dataset import DetectionDataset
 from util import mask_future
 from torch.utils.data import DataLoader

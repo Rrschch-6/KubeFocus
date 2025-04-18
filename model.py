@@ -222,6 +222,116 @@ class SimplifiedVisionTransformer(nn.Module):
         x = self.norm(x)
         return x
     
+########### Tabular Data Models ########### 
+class TabularPredictor(nn.Module):
+    def __init__(self,
+                 embed_dim,
+                 max_len,
+                 predictor_embed_dim=32,
+                 init_std=0.02):
+        super().__init__()
+        self.max_len = max_len
+        self.embed_dim = embed_dim
+        self.predictor_embed_dim = predictor_embed_dim
+        # Project input embeddings to a lower dimension
+        self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim)
+
+        self.mask_tokens = nn.Parameter(torch.zeros(1, 1, predictor_embed_dim))
+        torch.nn.init.trunc_normal_(self.mask_tokens, std=init_std)
+
+        self.net = nn.Sequential(
+            nn.Linear(predictor_embed_dim, predictor_embed_dim),
+            nn.ReLU(),
+            nn.Linear(predictor_embed_dim, predictor_embed_dim)
+        )
+
+        self.predictor_proj = nn.Linear(predictor_embed_dim, embed_dim)
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_len, predictor_embed_dim))
+        torch.nn.init.trunc_normal_(self.pos_embed, std=init_std)
+
+    def forward(self, ctxt, tgt, masks_ctxt, masks_tgt):
+        # Ensure masks are provided and in list form
+        assert masks_ctxt is not None and masks_tgt is not None, "Masks are required"
+        if not isinstance(masks_ctxt, list):
+            masks_ctxt = [masks_ctxt]
+        if not isinstance(masks_tgt, list):
+            masks_tgt = [masks_tgt]
+
+        B = ctxt.size(0)  # Batch size
+
+        # Project context tokens to predictor dimension
+        x = self.predictor_embed(ctxt)  # (B, N_ctxt, predictor_embed_dim)
+
+        # Add positional embeddings to context tokens
+        pos_emb_ctxt = self.pos_embed[:, :x.size(1), :]
+        x = x + pos_emb_ctxt
+
+        # Handle target tokens
+        if self.mask_tokens is not None:
+            # Use learnable mask tokens for target positions
+            num_tgt = self.max_len - x.size(1)
+            pred_tokens = self.mask_tokens.expand(B, num_tgt, -1)
+        else:
+            # Project target tokens and add small noise (simplified diffusion)
+            pred_tokens = self.predictor_embed(tgt)
+            pred_tokens = pred_tokens + torch.randn_like(pred_tokens) * 0.1
+
+        # Add positional embeddings to target tokens
+        pos_emb_tgt = self.pos_embed[:, x.size(1):, :]
+        pred_tokens = pred_tokens + pos_emb_tgt
+
+        # Concatenate context and target tokens
+        x = torch.cat([x, pred_tokens], dim=1)  # (B, max_len, predictor_embed_dim)
+
+        # Pass through MLP
+        x = self.net(x)
+
+        # Project back to original embedding dimension
+        x = self.predictor_proj(x)
+
+        # Return predictions for target tokens only
+        N_ctxt = ctxt.size(1)
+        return x[:, N_ctxt:, :]
+    
+    
+class TabularTransformerEncoder(nn.Module):
+    def __init__(self, num_features, max_length, embed_dim, num_heads, depth):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.max_length = max_length
+        self.num_features = num_features
+        self.num_heads = num_heads
+        self.depth = depth
+        self.embed = nn.Linear(num_features, embed_dim)  # Project N features to embed_dim
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_length, embed_dim))  # Learnable positional encodings
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=embed_dim,
+                nhead=num_heads,
+                dim_feedforward=embed_dim * 4,
+                dropout=0.1
+            ),
+            num_layers=depth
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x, masks=None):
+        # x shape: (batch_size, L, num_features)
+        B, L, _ = x.size()
+        assert L <= self.pos_embed.size(1), "Input length exceeds max length"
+        x = self.embed(x) + self.pos_embed[:, :x.size(1), :]  # Add positional encodings
+        
+        # Apply masking if provided
+        if masks is not None:
+            num_visible = masks.sum(dim=1)  # Number of visible patches per batch, shape (B,)
+            assert (num_visible == num_visible[0]).all(), "All batches must have the same number of visible patches"
+            x = x[masks].view(B, -1, self.embed_dim)  # (B, num_visible, embed_dim)
+
+        x = self.transformer(x)  # Output shape: (batch_size, L, embed_dim)
+        x = self.norm(x)
+        return x
+    
 
 # Example usage
 if __name__ == "__main__":
